@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+
+# am-lite: Minimalist AM with aria2c integration
+# Author: Gemini CLI
+# Idea: Use aria2c for downloads by wrapping wget in PATH
+
+set -e
+
+# Config
+AM_REPO="https://raw.githubusercontent.com/ivan-hc/AM/main"
+ARCH="$(uname -m)"
+[ "$ARCH" = "amd64" ] && ARCH=x86_64
+
+usage() {
+    echo "Usage: am-lite [option] [app]"
+    echo "Options:"
+    echo "  -i, install <app>   Install application"
+    echo "  -r, remove <app>    Remove application"
+    echo "  -u, update          Update all installed apps"
+    echo "  -h, help            Show this help"
+    exit 1
+}
+
+# Wrapper logic
+WRAPPERS_DIR=""
+setup_aria2_wrapper() {
+    [ -n "$WRAPPERS_DIR" ] && return 0
+    WRAPPERS_DIR=$(mktemp -d)
+    trap 'rm -rf "$WRAPPERS_DIR"' EXIT
+    
+    cat > "$WRAPPERS_DIR/wget" << 'EOF'
+#!/bin/bash
+# Fake wget that uses aria2c
+URL=""
+for arg in "$@"; do
+    if [[ "$arg" == http* ]]; then
+        URL="$arg"
+    fi
+done
+
+if [ -n "$URL" ]; then
+    echo "am-lite: Intercepted wget -> aria2c $URL"
+    aria2c -x 16 -s 16 -k 1M "$URL"
+else
+    # Fallback to real wget
+    command wget "$@"
+fi
+EOF
+    chmod +x "$WRAPPERS_DIR/wget"
+}
+
+install_app() {
+    APP=$1
+    [ -z "$APP" ] && usage
+    
+    echo "am-lite: Installing $APP..."
+    SCRIPT_URL="$AM_REPO/programs/$ARCH/$APP"
+    TEMP_SCRIPT=$(mktemp)
+    
+    if ! curl -fsL "$SCRIPT_URL" -o "$TEMP_SCRIPT"; then
+        echo "Error: Application '$APP' not found in $ARCH database."
+        exit 1
+    fi
+    
+    setup_aria2_wrapper
+    sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$TEMP_SCRIPT"
+    rm "$TEMP_SCRIPT"
+    echo "am-lite: $APP installed successfully."
+}
+
+remove_app() {
+    APP=$1
+    [ -z "$APP" ] && usage
+    
+    REMOVE_SCRIPT="/opt/$APP/remove"
+    if [ ! -f "$REMOVE_SCRIPT" ]; then
+        echo "Error: Application '$APP' not found or no remove script at $REMOVE_SCRIPT."
+        exit 1
+    fi
+    
+    echo "am-lite: Removing $APP..."
+    sudo bash "$REMOVE_SCRIPT"
+    echo "am-lite: $APP removed."
+}
+
+update_apps() {
+    echo "am-lite: Updating all applications..."
+    setup_aria2_wrapper
+    
+    for updater in /opt/*/AM-updater; do
+        if [ -f "$updater" ]; then
+            APP=$(basename "$(dirname "$updater")")
+            echo "am-lite: Checking updates for $APP..."
+            sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$updater"
+        fi
+    done
+    echo "am-lite: Updates complete."
+}
+
+# Main
+case "$1" in
+    -i|install) install_app "$2" ;;
+    -r|remove)  remove_app "$2" ;;
+    -u|update)  update_apps ;;
+    -h|help|"") usage ;;
+    *) echo "Unknown option: $1"; usage ;;
+esac
