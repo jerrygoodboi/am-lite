@@ -6,6 +6,7 @@
 set -e
 
 # Config
+INSTALL_LOCATION="/opt"
 AM_REPO="https://raw.githubusercontent.com/ivan-hc/AM/main"
 ARCH="$(uname -m)"
 [ "$ARCH" = "amd64" ] && ARCH=x86_64
@@ -103,7 +104,12 @@ update_all(){
     	done
 	echo "am-lite: Updates complete."
 }
-
+installed(){
+	echo "Currently installed applications..."
+    	for app in $INSTALL_LOCATION/*/AM-updater; do
+		echo $app | cut -d "/" -f 3
+	done
+}
 # Main
 case "$1" in
     -i|install) install_app "$2" ;;
@@ -115,6 +121,7 @@ case "$1" in
 			update_all
 		fi
 		;;
+    -l|list) installed ;;
     -h|help|"") usage ;;
     *) echo "Unknown option: $1"; usage ;;
 esac
