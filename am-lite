@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 
 # am-lite: Minimalist AM with aria2c integration
-# Author: Gemini CLI
-# Idea: Use aria2c for downloads by wrapping wget in PATH
+# Author: Jerry Ron Sunny
 
 set -e
 
@@ -21,7 +20,6 @@ usage() {
     exit 1
 }
 
-# Wrapper logic
 WRAPPERS_DIR=""
 setup_aria2_wrapper() {
     [ -n "$WRAPPERS_DIR" ] && return 0
@@ -39,10 +37,10 @@ for arg in "$@"; do
 done
 
 if [ -n "$URL" ]; then
-    echo "am-lite: Intercepted wget -> aria2c $URL"
     aria2c -x 16 -s 16 -k 1M "$URL"
 else
     # Fallback to real wget
+    echo "Install aria2c for better download speeds"
     command wget "$@"
 fi
 EOF
@@ -82,26 +80,41 @@ remove_app() {
     sudo bash "$REMOVE_SCRIPT"
     echo "am-lite: $APP removed."
 }
-
-update_apps() {
-    echo "am-lite: Updating all applications..."
-    setup_aria2_wrapper
-    
-    for updater in /opt/*/AM-updater; do
-        if [ -f "$updater" ]; then
-            APP=$(basename "$(dirname "$updater")")
-            echo "am-lite: Checking updates for $APP..."
-            sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$updater"
-        fi
-    done
-    echo "am-lite: Updates complete."
+update_single(){
+    	setup_aria2_wrapper
+	updater=/opt/$1/AM-updater 
+	if [ -f $updater ]; then
+    		APP=$(basename "$(dirname "$updater")")
+		echo "am-lite: Checking updates for $APP..."
+        	sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$updater"
+	else
+		echo "No $APP found"
+	fi
+}
+update_all(){
+    	echo "am-lite: Updating all applications..."
+    	setup_aria2_wrapper
+    	for updater in /opt/*/AM-updater; do
+        	if [ -f "$updater" ]; then
+            		APP=$(basename "$(dirname "$updater")")
+            		echo "am-lite: Checking updates for $APP..."
+            		sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$updater"
+        	fi
+    	done
+	echo "am-lite: Updates complete."
 }
 
 # Main
 case "$1" in
     -i|install) install_app "$2" ;;
     -r|remove)  remove_app "$2" ;;
-    -u|update)  update_apps ;;
+    -u|update)
+	    	if [ -n "$2" ]; then
+			update_single $2
+		else
+			update_all
+		fi
+		;;
     -h|help|"") usage ;;
     *) echo "Unknown option: $1"; usage ;;
 esac
