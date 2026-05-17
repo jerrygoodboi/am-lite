@@ -10,118 +10,237 @@ INSTALL_LOCATION="/opt"
 AM_REPO="https://raw.githubusercontent.com/ivan-hc/AM/main"
 ARCH="$(uname -m)"
 [ "$ARCH" = "amd64" ] && ARCH=x86_64
+export ARCH
+export AM_REPO
 
 usage() {
-    echo "Usage: am-lite [option] [app]"
-    echo "Options:"
-    echo "  -i, install <app>   Install application"
-    echo "  -r, remove <app>    Remove application"
-    echo "  -u, update          Update all installed apps"
-    echo "  -h, help            Show this help"
-    exit 1
+	echo "Usage: am-lite [option] [app]"
+	echo "Options:"
+	echo "  -i, install <app>   Install application"
+	echo "  -s, search <query>  Search for application"
+	echo "  -r, remove <app>    Remove application"
+	echo "  -u, update          Update all installed apps"
+	echo "  -h, help            Show this help"
+	exit 1
 }
 
 WRAPPERS_DIR=""
 setup_aria2_wrapper() {
-    [ -n "$WRAPPERS_DIR" ] && return 0
-    WRAPPERS_DIR=$(mktemp -d)
-    trap 'rm -rf "$WRAPPERS_DIR"' EXIT
-    
-    cat > "$WRAPPERS_DIR/wget" << 'EOF'
-#!/bin/bash
-# Fake wget that uses aria2c
-URL=""
-for arg in "$@"; do
-    if [[ "$arg" == http* ]]; then
-        URL="$arg"
-    fi
-done
+	[ -n "$WRAPPERS_DIR" ] && return 0
+	WRAPPERS_DIR=$(mktemp -d)
+	trap 'rm -rf "$WRAPPERS_DIR"' EXIT
 
-if [ -n "$URL" ]; then
-    aria2c -x 16 -s 16 -k 1M "$URL"
-else
-    # Fallback to real wget
-    echo "Install aria2c for better download speeds"
-    command wget "$@"
-fi
+	cat > "$WRAPPERS_DIR/wget" << 'EOF'
+	#!/bin/bash
+	# Fake wget that uses aria2c
+	URL=""
+	for arg in "$@"; do
+		if [[ "$arg" == http* ]]; then
+			URL="$arg"
+		fi
+	done
+
+	if [ -n "$URL" ]; then
+		aria2c --console-log-level=warn --summary-interval=1 -x 16 -s 16 -k 1M "$URL"
+	else
+		# Fallback to real wget
+		echo "Install aria2c for better download speeds"
+		command wget -q --show-progress "$@"
+	fi
 EOF
-    chmod +x "$WRAPPERS_DIR/wget"
+	chmod +x "$WRAPPERS_DIR/wget"
+}
+
+get_file_size() {
+	local url=$1
+	curl -sIL "$url" | grep -i Content-Length | awk '{print $2}' | tr -d '\r' | tail -n1
+}
+
+format_size() {
+	local bytes=$1
+	if [ -z "$bytes" ] || [ "$bytes" -eq 0 ]; then
+		echo "Unknown"
+		return
+	fi
+	if [ "$bytes" -lt 1024 ]; then
+		echo "${bytes} B"
+	elif [ "$bytes" -lt 1048576 ]; then
+		echo "$(echo "scale=2; $bytes/1024" | bc) KB"
+	else
+		echo "$(echo "scale=2; $bytes/1048576" | bc) MB"
+	fi
 }
 
 install_app() {
-    APP=$1
-    [ -z "$APP" ] && usage
-    
-    echo "am-lite: Installing $APP..."
-    SCRIPT_URL="$AM_REPO/programs/$ARCH/$APP"
-    TEMP_SCRIPT=$(mktemp)
-    
-    if ! curl -fsL "$SCRIPT_URL" -o "$TEMP_SCRIPT"; then
-        echo "Error: Application '$APP' not found in $ARCH database."
-        exit 1
-    fi
-    
-    setup_aria2_wrapper
-    sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$TEMP_SCRIPT"
-    rm "$TEMP_SCRIPT"
-    echo "am-lite: $APP installed successfully."
-}
+	[ -z "$1" ] && usage
+	
+	APPS=("$@")
+	TOTAL_SIZE=0
+	declare -A APP_SIZES
+	declare -A APP_STATUS
 
-remove_app() {
-    APP=$1
-    [ -z "$APP" ] && usage
-    
-    REMOVE_SCRIPT="/opt/$APP/remove"
-    if [ ! -f "$REMOVE_SCRIPT" ]; then
-        echo "Error: Application '$APP' not found or no remove script at $REMOVE_SCRIPT."
-        exit 1
-    fi
-    
-    echo "am-lite: Removing $APP..."
-    sudo bash "$REMOVE_SCRIPT"
-    echo "am-lite: $APP removed."
+	echo "am-lite: Fetching package info..."
+	for APP in "${APPS[@]}"; do
+		SCRIPT_URL="$AM_REPO/programs/$ARCH/$APP"
+		# Check if installed
+		if [ -d "$INSTALL_LOCATION/$APP" ]; then
+			APP_STATUS["$APP"]="[Installed]"
+		else
+			APP_STATUS["$APP"]="[New]"
+		fi
+
+		# Try to find the download URL from the script
+		# Many scripts use 'version=$(curl ...)' and then 'wget "$version"'
+		# We can try to grep for the URL or the logic. 
+		# High effort: dry-run script with mock wget to capture URL.
+		
+		TEMP_SCRIPT=$(mktemp)
+		if ! curl -fsL "$SCRIPT_URL" -o "$TEMP_SCRIPT"; then
+			echo "Error: Application '$APP' not found."
+			rm "$TEMP_SCRIPT"
+			exit 1
+		fi
+
+		# Try to find the download URL from the script
+		# 1. Dynamic detection: look for version assignment with curl (common in AM scripts)
+		DYNAMIC_CMD=$(grep -i "curl" "$TEMP_SCRIPT" | grep -i "grep" | head -n1 | sed -n 's/.*\$(\(curl.*\))/\1/p; s/.*`\(curl.*\)`/\1/p')
+		if [[ "$DYNAMIC_CMD" == curl* ]]; then
+			DL_URL=$(bash -c "$DYNAMIC_CMD" 2>/dev/null | grep -oE "https://[a-zA-Z0-9./_-]+" | head -n1)
+		fi
+
+		# 2. Static detection: look for direct binary URLs
+		if [ -z "$DL_URL" ]; then
+			DL_URL=$(grep -oE "https://[a-zA-Z0-9./_-]+" "$TEMP_SCRIPT" | grep -vE "github.com/ivan-hc|api.github.com|\.png$|\.jpg$|\.svg$|librewolf\.net$|aristocratos\.com$|btop\.png$" | grep -E "\.AppImage$|\.zip$|\.tar\.gz$|\.tar\.xz$|\.tar\.bz2$|\.7z$|\.run$|\.bin$" | head -n1)
+		fi
+		
+		# 3. Fallback: any direct URL that isn't a known repo or image
+		if [ -z "$DL_URL" ]; then
+			DL_URL=$(grep -oE "https://[a-zA-Z0-9./_-]+" "$TEMP_SCRIPT" | grep -vE "github.com/ivan-hc|api.github.com|\.png$|\.jpg$|\.svg$|librewolf\.net$|aristocratos\.com$|btop\.png$" | head -n1)
+		fi
+		
+		if [ -z "$DL_URL" ] || [ "$DL_URL" == "Unknown" ]; then
+			DL_URL="Unknown"
+			APP_SIZES["$APP"]=0
+		else
+			SIZE=$(get_file_size "$DL_URL")
+			APP_SIZES["$APP"]=$((SIZE + 0))
+			TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+		fi
+		rm "$TEMP_SCRIPT"
+	done
+
+	echo -e "\nPackages to install:"
+	echo "--------------------"
+	for APP in "${APPS[@]}"; do
+		SIZE_STR=$(format_size "${APP_SIZES["$APP"]}")
+		printf "%-20s %-12s %s\n" "$APP" "$SIZE_STR" "${APP_STATUS["$APP"]}"
+	done
+	echo "--------------------"
+	echo "Total download size: $(format_size $TOTAL_SIZE)"
+	echo ""
+
+	read -p "Proceed with installation? [Y/n] " confirm
+	confirm=${confirm:-Y}
+	if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+		echo "Aborted."
+		exit 0
+	fi
+
+	for APP in "${APPS[@]}"; do
+		if [ "${APP_STATUS["$APP"]}" == "[Installed]" ]; then
+			echo "am-lite: $APP is already installed. Skipping."
+			continue
+		fi
+		echo "am-lite: Installing $APP..."
+		SCRIPT_URL="$AM_REPO/programs/$ARCH/$APP"
+		TEMP_SCRIPT=$(mktemp)
+		curl -fsL "$SCRIPT_URL" -o "$TEMP_SCRIPT"
+		setup_aria2_wrapper
+		sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$TEMP_SCRIPT"
+		rm "$TEMP_SCRIPT"
+		echo "am-lite: $APP installed successfully."
+	done
 }
-update_single(){
-    	setup_aria2_wrapper
-	updater=/opt/$1/AM-updater 
-	if [ -f $updater ]; then
-    		APP=$(basename "$(dirname "$updater")")
-		echo "am-lite: Checking updates for $APP..."
-        	sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$updater"
+search_app() {
+	[ -z "$1" ] && usage
+	echo "am-lite: Searching for '$1'..."
+	DATABASE_URL="$AM_REPO/programs/$ARCH-apps"
+	RESULTS=$(curl -fsL "$DATABASE_URL" | grep -i "$1" | sed 's/◆ //') || true
+	if [ -z "$RESULTS" ]; then
+		echo "No results found for '$1'."
 	else
-		echo "No $APP found"
+		echo "$RESULTS"
 	fi
 }
+remove_app() {
+	[ -z "$1" ] && usage
+	for APP in "$@"; do
+		REMOVE_SCRIPT="/opt/$APP/remove"
+		if [ ! -f "$REMOVE_SCRIPT" ]; then
+			echo "Error: Application '$APP' not found or no remove script at $REMOVE_SCRIPT."
+			exit 1
+		fi
+
+		echo "am-lite: Removing $APP..."
+		sudo bash "$REMOVE_SCRIPT"
+		echo "am-lite: $APP removed."
+	done
+}
+update_single(){
+	setup_aria2_wrapper
+	for APP in "$@"; do
+		updater=/opt/$APP/AM-updater 
+		if [ -f "$updater" ]; then
+			echo "am-lite: Checking updates for $APP..."
+			sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$updater"
+		else
+			echo "No $APP found"
+		fi
+	done
+}
 update_all(){
-    	echo "am-lite: Updating all applications..."
-    	setup_aria2_wrapper
-    	for updater in /opt/*/AM-updater; do
-        	if [ -f "$updater" ]; then
-            		APP=$(basename "$(dirname "$updater")")
-            		echo "am-lite: Checking updates for $APP..."
-            		sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$updater"
-        	fi
-    	done
+	echo "am-lite: Updating all applications..."
+	setup_aria2_wrapper
+	for updater in /opt/*/AM-updater; do
+		if [ -f "$updater" ]; then
+			APP=$(basename "$(dirname "$updater")")
+			echo "am-lite: Checking updates for $APP..."
+			sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$updater"
+		fi
+	done
 	echo "am-lite: Updates complete."
 }
 installed(){
 	echo "Currently installed applications..."
-    	for app in $INSTALL_LOCATION/*/AM-updater; do
+	for app in $INSTALL_LOCATION/*/AM-updater; do
+		[ -e "$app" ] || continue
 		echo $app | cut -d "/" -f 3
 	done
 }
 # Main
 case "$1" in
-    -i|install) install_app "$2" ;;
-    -r|remove)  remove_app "$2" ;;
-    -u|update)
-	    	if [ -n "$2" ]; then
-			update_single $2
+	-i|install)
+		shift
+		install_app "$@"
+		;;
+	-s|search)
+		shift
+		search_app "$@"
+		;;
+	-r|remove)
+		shift
+		remove_app "$@"
+		;;
+	-u|update)
+		shift
+		if [ "$#" -gt 0 ]; then
+			update_single "$@"
 		else
 			update_all
 		fi
 		;;
-    -l|list) installed ;;
-    -h|help|"") usage ;;
-    *) echo "Unknown option: $1"; usage ;;
+	-l|list) installed ;;
+	-h|help|"") usage ;;
+	*) echo "Unknown option: $1"; usage ;;
 esac
+
