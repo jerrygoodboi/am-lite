@@ -1,55 +1,383 @@
 #!/usr/bin/env bash
-
-# am-lite: Minimalist AM with aria2c integration
+# am-lite: Minimalist AM with aria2c integration & user-space capabilities
 # Author: Jerry Ron Sunny
+# Upgraded for professional systems engineering and DevOps best practices.
 
-set -e
+set -euo pipefail
 
-# Config
-INSTALL_LOCATION="/opt"
+# --- CONFIGURATION & LOGGING DEFAULTS ---
 AM_REPO="https://raw.githubusercontent.com/ivan-hc/AM/main"
 ARCH="$(uname -m)"
 [ "$ARCH" = "amd64" ] && ARCH=x86_64
 export ARCH
 export AM_REPO
 
-usage() {
-	echo "Usage: am-lite [option] [app]"
-	echo "Options:"
-	echo "  -i, install <app>   Install application"
-	echo "  -s, search <query>  Search for application"
-	echo "  -r, remove <app>    Remove application"
-	echo "  -u, update          Update all installed apps"
-	echo "  -h, help            Show this help"
-	exit 1
+# CLI & Config Overrides
+USE_ARIA2=true
+MAX_CONNECTIONS=16
+LOG_LEVEL="INFO"
+AUTO_CONFIRM=false
+GLOBAL_INSTALL=false
+CLI_CONFIG=""
+
+# Directory Defaults (will be loaded based on privileges in load_config)
+INSTALL_LOCATION=""
+BIN_DIR=""
+DESKTOP_DIR=""
+LOG_FILE=""
+
+# Logging Levels Priority
+declare -A LOG_LEVELS=([DEBUG]=0 [INFO]=1 [WARN]=2 [ERROR]=3)
+
+# Log Message Handler
+log_message() {
+	local level="$1"
+	local msg="$2"
+	local level_val="${LOG_LEVELS[$level]:-1}"
+	local current_log_level_val="${LOG_LEVELS[${LOG_LEVEL:-INFO}]:-1}"
+
+	if [ "$level_val" -lt "$current_log_level_val" ]; then
+		return 0
+	fi
+
+	local timestamp
+	timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+	# Console output (colored stderr if interactive)
+	local color=""
+	local reset=""
+	if [ -t 2 ]; then
+		reset="\e[0m"
+		case "$level" in
+			DEBUG) color="\e[36m" ;; # Cyan
+			INFO)  color="\e[32m" ;; # Green
+			WARN)  color="\e[33m" ;; # Yellow
+			ERROR) color="\e[31m" ;; # Red
+		esac
+	fi
+
+	# Print to stderr
+	printf "${color}[%s] [%s] %s${reset}\n" "$timestamp" "$level" "$msg" >&2
+
+	# Log to file if directory is writable
+	if [ -n "${LOG_FILE:-}" ]; then
+		local log_dir
+		log_dir=$(dirname "$LOG_FILE")
+		if [ ! -d "$log_dir" ]; then
+			mkdir -p "$log_dir" 2>/dev/null || true
+		fi
+		if [ -w "$log_dir" ] || { [ -f "$LOG_FILE" ] && [ -w "$LOG_FILE" ]; }; then
+			printf "[%s] [%s] %s\n" "$timestamp" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
+		fi
+	fi
 }
 
-WRAPPERS_DIR=""
-setup_aria2_wrapper() {
-	[ -n "$WRAPPERS_DIR" ] && return 0
-	WRAPPERS_DIR=$(mktemp -d)
-	trap 'rm -rf "$WRAPPERS_DIR"' EXIT
+log_debug() { log_message "DEBUG" "$1"; }
+log_info()  { log_message "INFO" "$1"; }
+log_warn()  { log_message "WARN" "$1"; }
+log_error() { log_message "ERROR" "$1"; }
 
-	cat > "$WRAPPERS_DIR/wget" << 'EOF'
-	#!/bin/bash
-	# Fake wget that uses aria2c
-	URL=""
-	for arg in "$@"; do
-		if [[ "$arg" == http* ]]; then
-			URL="$arg"
+# --- SYSTEM INTEGRATION & SETUP ---
+
+# Load system and user configuration
+load_config() {
+	local default_config="/etc/am-lite.conf"
+	local user_config="${XDG_CONFIG_HOME:-$HOME/.config}/am-lite/config"
+
+	# Initialize defaults based on privileges
+	if [ "$EUID" -eq 0 ] || [ "$GLOBAL_INSTALL" = true ]; then
+		INSTALL_LOCATION="${INSTALL_LOCATION:-/opt}"
+		BIN_DIR="${BIN_DIR:-/usr/local/bin}"
+		DESKTOP_DIR="${DESKTOP_DIR:-/usr/share/applications}"
+		LOG_FILE="${LOG_FILE:-/var/log/am-lite.log}"
+	else
+		INSTALL_LOCATION="${INSTALL_LOCATION:-$HOME/.local/share/am-lite/opt}"
+		BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+		DESKTOP_DIR="${DESKTOP_DIR:-$HOME/.local/share/applications}"
+		LOG_FILE="${LOG_FILE:-${XDG_STATE_HOME:-$HOME/.local/state}/am-lite/am-lite.log}"
+	fi
+
+	# Source system-wide configuration
+	if [ -f "$default_config" ]; then
+		log_debug "Loading system config: $default_config"
+		# shellcheck disable=SC1090
+		source "$default_config"
+	fi
+
+	# Source CLI specified config
+	if [ -n "$CLI_CONFIG" ]; then
+		if [ -f "$CLI_CONFIG" ]; then
+			log_debug "Loading CLI config: $CLI_CONFIG"
+			# shellcheck disable=SC1090
+			source "$CLI_CONFIG"
+		else
+			log_error "Config file '$CLI_CONFIG' not found."
+			exit 1
+		fi
+	# Source user config
+	elif [ -f "$user_config" ]; then
+		log_debug "Loading user config: $user_config"
+		# shellcheck disable=SC1090
+		source "$user_config"
+	fi
+}
+
+# Acquire lockfile to prevent parallel execution conflicts
+LOCK_FILE=""
+acquire_lock() {
+	local lock_dir
+	if [ "$EUID" -eq 0 ] || [ "$GLOBAL_INSTALL" = true ]; then
+		LOCK_FILE="/run/am-lite.lock"
+	else
+		LOCK_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/am-lite/am-lite.lock"
+	fi
+
+	lock_dir=$(dirname "$LOCK_FILE")
+	if [ ! -d "$lock_dir" ]; then
+		mkdir -p "$lock_dir" 2>/dev/null || true
+	fi
+
+	if touch "$LOCK_FILE" 2>/dev/null; then
+		exec 9>"$LOCK_FILE"
+	else
+		log_warn "Could not create lockfile '$LOCK_FILE'. Running without locking protection."
+		LOCK_FILE=""
+		return 0
+	fi
+
+	if ! flock -n 9; then
+		log_error "Another instance of am-lite is currently running (locked by '$LOCK_FILE'). Exiting."
+		exit 1
+	fi
+	log_debug "Acquired process lock: $LOCK_FILE"
+}
+
+release_lock() {
+	if [ -n "$LOCK_FILE" ] && [ -f "$LOCK_FILE" ]; then
+		flock -u 9 2>/dev/null || true
+		rm -f "$LOCK_FILE" 2>/dev/null || true
+		log_debug "Released process lock"
+	fi
+}
+
+# Run command with sudo if we require global install and are not root
+RUN_AS_ROOT=false
+run_privileged() {
+	if [ "$EUID" -eq 0 ]; then
+		"$@"
+	else
+		if command -v sudo >/dev/null 2>&1; then
+			sudo "$@"
+		else
+			log_error "This action requires root privileges, but sudo is not available."
+			exit 1
+		fi
+	fi
+}
+
+# Trap / Cleanup handler
+CLEANUP_PATHS=()
+cleanup() {
+	local exit_code=$?
+	log_debug "Cleaning up temporary directories..."
+	release_lock
+
+	for path in "${CLEANUP_PATHS[@]:-}"; do
+		if [ -n "$path" ]; then
+			if [ -d "$path" ]; then
+				rm -rf "$path"
+			elif [ -f "$path" ]; then
+				rm -f "$path"
+			fi
 		fi
 	done
 
-	if [ -n "$URL" ]; then
-		aria2c --console-log-level=warn --summary-interval=1 -x 16 -s 16 -k 1M "$URL"
-	else
-		# Fallback to real wget
-		echo "Install aria2c for better download speeds"
-		command wget -q --show-progress "$@"
+	exit "$exit_code"
+}
+trap cleanup EXIT INT TERM
+
+# --- WRAPPERS (ARIA2C SHIMS) ---
+WRAPPERS_DIR=""
+setup_aria2_wrappers() {
+	[ -n "$WRAPPERS_DIR" ] && return 0
+	if [ "$USE_ARIA2" != "true" ] || ! command -v aria2c >/dev/null 2>&1; then
+		log_debug "Using standard wget/curl (aria2c integration not active)."
+		return 0
 	fi
+
+	WRAPPERS_DIR=$(mktemp -d)
+	CLEANUP_PATHS+=("$WRAPPERS_DIR")
+	log_debug "Created aria2c wrappers in $WRAPPERS_DIR"
+
+	# 1. Fake Wget wrapper
+	cat > "$WRAPPERS_DIR/wget" << EOF
+#!/usr/bin/env bash
+ORIG_ARGS=("\$@")
+OUTPUT=""
+PREFIX=""
+URL=""
+QUIET=false
+
+while [[ \$# -gt 0 ]]; do
+	case "\$1" in
+		-O|--output-document)
+			OUTPUT="\$2"
+			shift 2
+			;;
+		-O*)
+			OUTPUT="\${1#-O}"
+			shift
+			;;
+		--output-document=*)
+			OUTPUT="\${1#--output-document=}"
+			shift
+			;;
+		-P|--directory-prefix)
+			PREFIX="\$2"
+			shift 2
+			;;
+		--directory-prefix=*)
+			PREFIX="\${1#--directory-prefix=}"
+			shift
+			;;
+		-q|--quiet)
+			QUIET=true
+			shift
+			;;
+		http*|ftp*)
+			URL="\$1"
+			shift
+			;;
+		*)
+			shift
+			;;
+	esac
+done
+
+if [ -n "\$URL" ]; then
+	ARGS=(--console-log-level=warn --summary-interval=1)
+	ARGS+=("-x" "$MAX_CONNECTIONS" "-s" "$MAX_CONNECTIONS" "-k" "1M")
+
+	if [ -n "\$PREFIX" ]; then
+		ARGS+=("-d" "\$PREFIX")
+	fi
+
+	if [ -n "\$OUTPUT" ]; then
+		out_dir=\$(dirname "\$OUTPUT")
+		out_file=\$(basename "\$OUTPUT")
+		if [ "\$out_dir" != "." ]; then
+			if [ -n "\$PREFIX" ]; then
+				ARGS+=("-d" "\$PREFIX/\$out_dir")
+			else
+				ARGS+=("-d" "\$out_dir")
+			fi
+		fi
+		ARGS+=("-o" "\$out_file")
+	fi
+
+	if [ "\$QUIET" = true ]; then
+		ARGS+=("--quiet=true")
+	fi
+
+	aria2c "\${ARGS[@]}" "\$URL"
+else
+	WRAPPER_DIR=\$(dirname "\$0")
+	CLEANED_PATH=""
+	IFS=:
+	for i in \$PATH; do
+		if [ "\$i" != "\$WRAPPER_DIR" ]; then
+			if [ -z "\$CLEANED_PATH" ]; then
+				CLEANED_PATH="\$i"
+			else
+				CLEANED_PATH="\$CLEANED_PATH:\$i"
+			fi
+		fi
+	done
+	unset IFS
+	exec env PATH="\$CLEANED_PATH" wget "\${ORIG_ARGS[@]}"
+fi
 EOF
 	chmod +x "$WRAPPERS_DIR/wget"
+
+	# 2. Fake Curl wrapper
+	cat > "$WRAPPERS_DIR/curl" << EOF
+#!/usr/bin/env bash
+ORIG_ARGS=("\$@")
+OUTPUT=""
+URL=""
+REMOTE_NAME=false
+SILENT=false
+
+while [[ \$# -gt 0 ]]; do
+	case "\$1" in
+		-o|--output)
+			OUTPUT="\$2"
+			shift 2
+			;;
+		--output=*)
+			OUTPUT="\${1#--output=}"
+			shift
+			;;
+		-O|--remote-name)
+			REMOTE_NAME=true
+			shift
+			;;
+		-s|--silent)
+			SILENT=true
+			shift
+			;;
+		-L|--location|-f|--fail|-S|--show-error|--compressed)
+			shift
+			;;
+		http*|ftp*)
+			URL="\$1"
+			shift
+			;;
+		*)
+			shift
+			;;
+	esac
+done
+
+if [ -n "\$URL" ] && { [ -n "\$OUTPUT" ] || [ "\$REMOTE_NAME" = true ]; }; then
+	ARGS=(--console-log-level=warn --summary-interval=1)
+	ARGS+=("-x" "$MAX_CONNECTIONS" "-s" "$MAX_CONNECTIONS" "-k" "1M")
+
+	if [ -n "\$OUTPUT" ]; then
+		out_dir=\$(dirname "\$OUTPUT")
+		out_file=\$(basename "\$OUTPUT")
+		if [ "\$out_dir" != "." ]; then
+			ARGS+=("-d" "\$out_dir")
+		fi
+		ARGS+=("-o" "\$out_file")
+	fi
+
+	if [ "\$SILENT" = true ]; then
+		ARGS+=("--quiet=true")
+	fi
+
+	aria2c "\${ARGS[@]}" "\$URL"
+else
+	WRAPPER_DIR=\$(dirname "\$0")
+	CLEANED_PATH=""
+	IFS=:
+	for i in \$PATH; do
+		if [ "\$i" != "\$WRAPPER_DIR" ]; then
+			if [ -z "\$CLEANED_PATH" ]; then
+				CLEANED_PATH="\$i"
+			else
+				CLEANED_PATH="\$CLEANED_PATH:\$i"
+			fi
+		fi
+	done
+	unset IFS
+	exec env PATH="\$CLEANED_PATH" curl "\${ORIG_ARGS[@]}"
+fi
+EOF
+	chmod +x "$WRAPPERS_DIR/curl"
 }
+
+# --- BUSINESS LOGIC HELPER FUNCTIONS ---
 
 get_file_size() {
 	local url=$1
@@ -71,176 +399,467 @@ format_size() {
 	fi
 }
 
-install_app() {
-	[ -z "$1" ] && usage
+translate_script_paths() {
+	local script_path="$1"
+	log_debug "Translating installer script paths for user-space installation..."
 	
-	APPS=("$@")
-	TOTAL_SIZE=0
-	declare -A APP_SIZES
-	declare -A APP_STATUS
+	python3 -c '
+import sys, re
+user_opt = sys.argv[1]
+user_bin = sys.argv[2]
+user_desktop = sys.argv[3]
+script_file = sys.argv[4]
 
-	echo "am-lite: Fetching package info..."
-	for APP in "${APPS[@]}"; do
-		SCRIPT_URL="$AM_REPO/programs/$ARCH/$APP"
-		# Check if installed
-		if [ -d "$INSTALL_LOCATION/$APP" ]; then
-			APP_STATUS["$APP"]="[Installed]"
+with open(script_file, "r") as f:
+    content = f.read()
+
+pattern_opt = r"(?<=[\s\"\x27=])\/opt\b|^\/opt\b"
+pattern_bin = r"(?<=[\s\"\x27=])\/usr\/local\/bin\b|^\/usr\/local\/bin\b"
+pattern_desktop = r"(?<=[\s\"\x27=])\/usr\/(local\/)?share\/applications\b|^\/usr\/(local\/)?share\/applications\b"
+
+content = re.sub(pattern_opt, user_opt, content)
+content = re.sub(pattern_bin, user_bin, content)
+content = re.sub(pattern_desktop, user_desktop, content)
+
+with open(script_file, "w") as f:
+    f.write(content)
+' "$INSTALL_LOCATION" "$BIN_DIR" "$DESKTOP_DIR" "$script_path"
+}
+
+prepare_target_dirs() {
+	if [ "$RUN_AS_ROOT" = true ]; then
+		run_privileged mkdir -p "$INSTALL_LOCATION" "$BIN_DIR" "$DESKTOP_DIR"
+	else
+		mkdir -p "$INSTALL_LOCATION" "$BIN_DIR" "$DESKTOP_DIR"
+	fi
+}
+
+update_desktop_db() {
+	log_debug "Updating desktop application database..."
+	if [ "$RUN_AS_ROOT" = true ]; then
+		if command -v update-desktop-database >/dev/null 2>&1; then
+			run_privileged update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+		fi
+	else
+		if command -v update-desktop-database >/dev/null 2>&1; then
+			update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+		fi
+	fi
+}
+
+# --- ACTIONS ---
+
+install_app() {
+	if [ "$#" -eq 0 ]; then
+		usage
+	fi
+	
+	local apps=("$@")
+	local total_size=0
+	declare -A app_sizes
+	declare -A app_status
+
+	log_info "Fetching package information from repository..."
+	for app in "${apps[@]}"; do
+		local script_url="$AM_REPO/programs/$ARCH/$app"
+		
+		if [ -d "$INSTALL_LOCATION/$app" ]; then
+			app_status["$app"]="[Installed]"
 		else
-			APP_STATUS["$APP"]="[New]"
+			app_status["$app"]="[New]"
 		fi
 
-		# Try to find the download URL from the script
-		# Many scripts use 'version=$(curl ...)' and then 'wget "$version"'
-		# We can try to grep for the URL or the logic. 
-		# High effort: dry-run script with mock wget to capture URL.
-		
-		TEMP_SCRIPT=$(mktemp)
-		if ! curl -fsL "$SCRIPT_URL" -o "$TEMP_SCRIPT"; then
-			echo "Error: Application '$APP' not found."
-			rm "$TEMP_SCRIPT"
+		# Download installer script safely to mktemp
+		local temp_script
+		temp_script=$(mktemp)
+		if ! curl -fsL "$script_url" -o "$temp_script"; then
+			log_error "Application '$app' not found in repo."
+			rm -f "$temp_script"
 			exit 1
 		fi
 
-		# Try to find the download URL from the script
-		# 1. Dynamic detection: look for version assignment with curl (common in AM scripts)
-		DYNAMIC_CMD=$(grep -i "curl" "$TEMP_SCRIPT" | grep -i "grep" | head -n1 | sed -n 's/.*\$(\(curl.*\))/\1/p; s/.*`\(curl.*\)`/\1/p')
-		if [[ "$DYNAMIC_CMD" == curl* ]]; then
-			DL_URL=$(bash -c "$DYNAMIC_CMD" 2>/dev/null | grep -oE "https://[a-zA-Z0-9./_-]+" | head -n1)
+		# Extract download URL heuristics
+		local dl_url=""
+		local dynamic_cmd
+		# shellcheck disable=SC2016
+		dynamic_cmd=$(grep -i "curl" "$temp_script" | grep -i "grep" | head -n1 | sed -n 's/.*\$(\(curl.*\))/\1/p; s/.*`\(curl.*\)`/\1/p' || true)
+		if [[ "$dynamic_cmd" == curl* ]]; then
+			dl_url=$(bash -c "$dynamic_cmd" 2>/dev/null | grep -oE "https://[a-zA-Z0-9./_-]+" | head -n1 || true)
 		fi
 
-		# 2. Static detection: look for direct binary URLs
-		if [ -z "$DL_URL" ]; then
-			DL_URL=$(grep -oE "https://[a-zA-Z0-9./_-]+" "$TEMP_SCRIPT" | grep -vE "github.com/ivan-hc|api.github.com|\.png$|\.jpg$|\.svg$|librewolf\.net$|aristocratos\.com$|btop\.png$" | grep -E "\.AppImage$|\.zip$|\.tar\.gz$|\.tar\.xz$|\.tar\.bz2$|\.7z$|\.run$|\.bin$" | head -n1)
+		if [ -z "$dl_url" ]; then
+			dl_url=$(grep -oE "https://[a-zA-Z0-9./_-]+" "$temp_script" | grep -vE "github.com/ivan-hc|api.github.com|\.png$|\.jpg$|\.svg$|librewolf\.net$|aristocratos\.com$|btop\.png$" | grep -E "\.AppImage$|\.zip$|\.tar\.gz$|\.tar\.xz$|\.tar\.bz2$|\.7z$|\.run$|\.bin$" | head -n1 || true)
 		fi
 		
-		# 3. Fallback: any direct URL that isn't a known repo or image
-		if [ -z "$DL_URL" ]; then
-			DL_URL=$(grep -oE "https://[a-zA-Z0-9./_-]+" "$TEMP_SCRIPT" | grep -vE "github.com/ivan-hc|api.github.com|\.png$|\.jpg$|\.svg$|librewolf\.net$|aristocratos\.com$|btop\.png$" | head -n1)
+		if [ -z "$dl_url" ]; then
+			dl_url=$(grep -oE "https://[a-zA-Z0-9./_-]+" "$temp_script" | grep -vE "github.com/ivan-hc|api.github.com|\.png$|\.jpg$|\.svg$|librewolf\.net$|aristocratos\.com$|btop\.png$" | head -n1 || true)
 		fi
 		
-		if [ -z "$DL_URL" ] || [ "$DL_URL" == "Unknown" ]; then
-			DL_URL="Unknown"
-			APP_SIZES["$APP"]=0
+		if [ -z "$dl_url" ]; then
+			dl_url="Unknown"
+			app_sizes["$app"]=0
 		else
-			SIZE=$(get_file_size "$DL_URL")
-			APP_SIZES["$APP"]=$((SIZE + 0))
-			TOTAL_SIZE=$((TOTAL_SIZE + SIZE))
+			local size
+			size=$(get_file_size "$dl_url" || echo 0)
+			app_sizes["$app"]=$((size + 0))
+			total_size=$((total_size + size))
 		fi
-		rm "$TEMP_SCRIPT"
+		rm -f "$temp_script"
 	done
 
+	# Print Installation Plan
 	echo -e "\nPackages to install:"
-	echo "--------------------"
-	for APP in "${APPS[@]}"; do
-		SIZE_STR=$(format_size "${APP_SIZES["$APP"]}")
-		printf "%-20s %-12s %s\n" "$APP" "$SIZE_STR" "${APP_STATUS["$APP"]}"
+	echo "----------------------------------------------------"
+	for app in "${apps[@]}"; do
+		local size_str
+		size_str=$(format_size "${app_sizes["$app"]}")
+		printf "%-25s %-12s %s\n" "$app" "$size_str" "${app_status["$app"]}"
 	done
-	echo "--------------------"
-	echo "Total download size: $(format_size $TOTAL_SIZE)"
+	echo "----------------------------------------------------"
+	echo "Total download size: $(format_size $total_size)"
+	echo "Install Location:    $INSTALL_LOCATION"
 	echo ""
 
-	read -p "Proceed with installation? [Y/n] " confirm
-	confirm=${confirm:-Y}
-	if [[ ! "$confirm" =~ ^[yY]$ ]]; then
-		echo "Aborted."
-		exit 0
+	# Confirm installation
+	if [ "$AUTO_CONFIRM" != "true" ]; then
+		read -r -p "Proceed with installation? [Y/n] " confirm
+		confirm=${confirm:-Y}
+		if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+			log_info "Installation aborted."
+			exit 0
+		fi
 	fi
 
-	for APP in "${APPS[@]}"; do
-		if [ "${APP_STATUS["$APP"]}" == "[Installed]" ]; then
-			echo "am-lite: $APP is already installed. Skipping."
+	prepare_target_dirs
+	setup_aria2_wrappers
+
+	for app in "${apps[@]}"; do
+		if [ "${app_status["$app"]}" == "[Installed]" ]; then
+			log_info "$app is already installed. Skipping."
 			continue
 		fi
-		echo "am-lite: Installing $APP..."
-		SCRIPT_URL="$AM_REPO/programs/$ARCH/$APP"
-		TEMP_SCRIPT=$(mktemp)
-		curl -fsL "$SCRIPT_URL" -o "$TEMP_SCRIPT"
-		setup_aria2_wrapper
-		sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$TEMP_SCRIPT"
-		rm "$TEMP_SCRIPT"
-		echo "am-lite: $APP installed successfully."
+
+		log_info "Installing $app..."
+		local script_url="$AM_REPO/programs/$ARCH/$app"
+		local temp_script
+		temp_script=$(mktemp)
+		curl -fsL "$script_url" -o "$temp_script"
+
+		# Translate paths if running in user-space mode
+		if [ "$RUN_AS_ROOT" = false ]; then
+			translate_script_paths "$temp_script"
+		fi
+
+		# Run installer
+		if [ "$RUN_AS_ROOT" = true ]; then
+			run_privileged env "PATH=${WRAPPERS_DIR:-$PATH}:$PATH" bash "$temp_script"
+		else
+			env "PATH=${WRAPPERS_DIR:-$PATH}:$PATH" bash "$temp_script"
+		fi
+
+		rm -f "$temp_script"
+		log_info "$app installed successfully."
 	done
+
+	update_desktop_db
 }
+
 search_app() {
-	[ -z "$1" ] && usage
-	echo "am-lite: Searching for '$1'..."
-	DATABASE_URL="$AM_REPO/programs/$ARCH-apps"
-	RESULTS=$(curl -fsL "$DATABASE_URL" | grep -i "$1" | sed 's/◆ //') || true
-	if [ -z "$RESULTS" ]; then
-		echo "No results found for '$1'."
+	if [ "$#" -eq 0 ]; then
+		usage
+	fi
+	local query="$1"
+	log_info "Searching database for '$query'..."
+	local db_url="$AM_REPO/programs/$ARCH-apps"
+	local results
+	results=$(curl -fsL "$db_url" | grep -i "$query" | sed 's/◆ //' || true)
+	if [ -z "$results" ]; then
+		log_info "No results found for '$query'."
 	else
-		echo "$RESULTS"
+		echo "$results"
 	fi
 }
+
 remove_app() {
-	[ -z "$1" ] && usage
-	for APP in "$@"; do
-		REMOVE_SCRIPT="/opt/$APP/remove"
-		if [ ! -f "$REMOVE_SCRIPT" ]; then
-			echo "Error: Application '$APP' not found or no remove script at $REMOVE_SCRIPT."
+	if [ "$#" -eq 0 ]; then
+		usage
+	fi
+	prepare_target_dirs
+	local -a search_locs
+	read -ra search_locs <<< "$(resolve_install_locations)"
+	for app in "$@"; do
+		local remove_script=""
+		local found_loc=""
+		for loc in "${search_locs[@]}"; do
+			if [ -f "$loc/$app/remove" ]; then
+				remove_script="$loc/$app/remove"
+				found_loc="$loc"
+				break
+			fi
+		done
+
+		if [ -z "$remove_script" ]; then
+			log_error "Application '$app' not found or remover not present in any known location."
 			exit 1
 		fi
 
-		echo "am-lite: Removing $APP..."
-		sudo bash "$REMOVE_SCRIPT"
-		echo "am-lite: $APP removed."
-	done
-}
-update_single(){
-	setup_aria2_wrapper
-	for APP in "$@"; do
-		updater=/opt/$APP/AM-updater 
-		if [ -f "$updater" ]; then
-			echo "am-lite: Checking updates for $APP..."
-			sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$updater"
+		log_info "Removing $app (from $found_loc)..."
+		if [ "$RUN_AS_ROOT" = true ] || [ "$found_loc" = "/opt" ]; then
+			run_privileged bash "$remove_script"
 		else
-			echo "No $APP found"
+			bash "$remove_script"
 		fi
+		log_info "$app removed successfully."
 	done
+	update_desktop_db
 }
-update_all(){
-	echo "am-lite: Updating all applications..."
-	setup_aria2_wrapper
-	for updater in /opt/*/AM-updater; do
-		if [ -f "$updater" ]; then
-			APP=$(basename "$(dirname "$updater")")
-			echo "am-lite: Checking updates for $APP..."
-			sudo env "PATH=$WRAPPERS_DIR:$PATH" bash "$updater"
-		fi
-	done
-	echo "am-lite: Updates complete."
-}
-installed(){
-	echo "Currently installed applications..."
-	for app in $INSTALL_LOCATION/*/AM-updater; do
-		[ -e "$app" ] || continue
-		echo $app | cut -d "/" -f 3
-	done
-}
-# Main
-case "$1" in
-	-i|install)
-		shift
-		install_app "$@"
-		;;
-	-s|search)
-		shift
-		search_app "$@"
-		;;
-	-r|remove)
-		shift
-		remove_app "$@"
-		;;
-	-u|update)
-		shift
-		if [ "$#" -gt 0 ]; then
-			update_single "$@"
-		else
-			update_all
-		fi
-		;;
-	-l|list) installed ;;
-	-h|help|"") usage ;;
-	*) echo "Unknown option: $1"; usage ;;
-esac
 
+# Returns a list of directories to scan for AM-managed app subdirectories.
+# Always includes INSTALL_LOCATION; also adds /opt as a fallback when running
+# in user-space so that apps installed by the upstream 'am' tool are visible.
+resolve_install_locations() {
+	local -a locs
+	locs=("$INSTALL_LOCATION")
+	# If user-space mode and /opt is not already the install location, add /opt
+	# as a read-only fallback (apps there were installed by the original 'am' tool).
+	if [ "$RUN_AS_ROOT" = false ] && [ "$INSTALL_LOCATION" != "/opt" ] && [ -d "/opt" ]; then
+		locs+=("/opt")
+	fi
+	echo "${locs[@]}"
+}
+
+update_single() {
+	setup_aria2_wrappers
+	local -a search_locs
+	read -ra search_locs <<< "$(resolve_install_locations)"
+	for app in "$@"; do
+		local updater=""
+		local found_loc=""
+		for loc in "${search_locs[@]}"; do
+			if [ -f "$loc/$app/AM-updater" ]; then
+				updater="$loc/$app/AM-updater"
+				found_loc="$loc"
+				break
+			fi
+		done
+
+		if [ -n "$updater" ]; then
+			log_info "Checking updates for $app (from $found_loc)..."
+
+			# Only translate paths for am-lite user-space managed apps
+			if [ "$RUN_AS_ROOT" = false ] && [ "$found_loc" = "$INSTALL_LOCATION" ]; then
+				translate_script_paths "$updater"
+			fi
+
+			if [ "$RUN_AS_ROOT" = true ] || [ "$found_loc" = "/opt" ]; then
+				run_privileged env "PATH=${WRAPPERS_DIR:-$PATH}:$PATH" bash "$updater"
+			else
+				env "PATH=${WRAPPERS_DIR:-$PATH}:$PATH" bash "$updater"
+			fi
+		else
+			log_warn "Application '$app' is not installed or has no updater."
+		fi
+	done
+}
+
+update_all() {
+	log_info "Updating all installed applications..."
+	setup_aria2_wrappers
+
+	local -a search_locs
+	read -ra search_locs <<< "$(resolve_install_locations)"
+	local found=false
+
+	for loc in "${search_locs[@]}"; do
+		[ -d "$loc" ] || continue
+		for updater in "$loc"/*/AM-updater; do
+			[ -f "$updater" ] || continue
+			found=true
+			local app
+			app=$(basename "$(dirname "$updater")")
+			log_info "Checking updates for $app (from $loc)..."
+
+			# Only translate paths for am-lite user-space managed apps
+			if [ "$RUN_AS_ROOT" = false ] && [ "$loc" = "$INSTALL_LOCATION" ]; then
+				translate_script_paths "$updater"
+			fi
+
+			if [ "$RUN_AS_ROOT" = true ] || [ "$loc" = "/opt" ]; then
+				run_privileged env "PATH=${WRAPPERS_DIR:-$PATH}:$PATH" bash "$updater"
+			else
+				env "PATH=${WRAPPERS_DIR:-$PATH}:$PATH" bash "$updater"
+			fi
+		done
+	done
+
+	if [ "$found" = false ]; then
+		log_info "No upgradable applications found."
+	else
+		log_info "All updates complete."
+	fi
+}
+
+installed() {
+	log_info "Currently installed applications:"
+	local -a search_locs
+	read -ra search_locs <<< "$(resolve_install_locations)"
+	local found=false
+
+	for loc in "${search_locs[@]}"; do
+		[ -d "$loc" ] || continue
+		for updater in "$loc"/*/AM-updater; do
+			[ -e "$updater" ] || continue
+			found=true
+			local app
+			app=$(basename "$(dirname "$updater")")
+			printf "%-20s  [%s]\n" "$app" "$loc"
+		done
+	done
+
+	if [ "$found" = false ]; then
+		echo "No applications installed."
+	fi
+}
+
+show_version() {
+	echo "am-lite version 2.0.0"
+}
+
+usage() {
+	echo "Usage: am-lite [global options] <command> [arguments]"
+	echo ""
+	echo "Commands:"
+	echo "  -i, install <app>...    Install one or more applications"
+	echo "  -r, remove <app>...     Remove one or more applications"
+	echo "  -u, update [app...]     Update specified apps (or all if none specified)"
+	echo "  -s, search <query>      Search the database for an application"
+	echo "  -l, list                List installed applications"
+	echo "  -h, help                Show this help message"
+	echo ""
+	echo "Global Options:"
+	echo "  -y, --yes               Automatic 'yes' to prompts (runs non-interactively)"
+	echo "  -g, --global, --system  Force system-wide installation (defaults to user mode if not root)"
+	echo "  -c, --config <file>     Use specific configuration file"
+	echo "  --verbose               Enable verbose debug logging"
+	echo "  -V, --version           Show version information"
+	exit 1
+}
+
+# --- COMMAND LINE PARSING ---
+
+ACTION=""
+ACTION_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		-h|--help|help)
+			usage
+			;;
+		-V|--version|version)
+			show_version
+			exit 0
+			;;
+		-y|--yes)
+			AUTO_CONFIRM=true
+			shift
+			;;
+		-g|--global|--system)
+			GLOBAL_INSTALL=true
+			shift
+			;;
+		-c|--config)
+			if [ -z "${2:-}" ]; then
+				echo "Error: --config requires a file path." >&2
+				exit 1
+			fi
+			CLI_CONFIG="$2"
+			shift 2
+			;;
+		--verbose)
+			LOG_LEVEL="DEBUG"
+			shift
+			;;
+		-i|install)
+			ACTION="install"
+			shift
+			ACTION_ARGS+=("$@")
+			break
+			;;
+		-s|search)
+			ACTION="search"
+			shift
+			ACTION_ARGS+=("$@")
+			break
+			;;
+		-r|remove)
+			ACTION="remove"
+			shift
+			ACTION_ARGS+=("$@")
+			break
+			;;
+		-u|update)
+			ACTION="update"
+			shift
+			ACTION_ARGS+=("$@")
+			break
+			;;
+		-l|list)
+			ACTION="list"
+			shift
+			ACTION_ARGS+=("$@")
+			break
+			;;
+		-*)
+			echo "Unknown option: $1" >&2
+			usage
+			;;
+		*)
+			# Treat first argument as action if it has no leading dash
+			# (like am-lite list)
+			echo "Unknown command or option: $1" >&2
+			usage
+			;;
+	esac
+done
+
+# Main Execution Flow
+main() {
+	load_config
+	acquire_lock
+
+	RUN_AS_ROOT=false
+	if [ "$EUID" -eq 0 ] || [ "$GLOBAL_INSTALL" = true ]; then
+		RUN_AS_ROOT=true
+	fi
+
+	log_debug "Running in root/privileged mode: $RUN_AS_ROOT"
+	log_debug "Install directory: $INSTALL_LOCATION"
+	log_debug "Binary symlink directory: $BIN_DIR"
+
+	case "$ACTION" in
+		install)
+			install_app "${ACTION_ARGS[@]}"
+			;;
+		search)
+			search_app "${ACTION_ARGS[@]}"
+			;;
+		remove)
+			remove_app "${ACTION_ARGS[@]}"
+			;;
+		update)
+			if [ "${#ACTION_ARGS[@]}" -gt 0 ]; then
+				update_single "${ACTION_ARGS[@]}"
+			else
+				update_all
+			fi
+			;;
+		list)
+			installed
+			;;
+		*)
+			usage
+			;;
+	esac
+}
+
+main

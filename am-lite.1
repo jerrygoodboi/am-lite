@@ -1,0 +1,77 @@
+.TH AM-LITE 1 "June 2026" "am-lite 2.0.0" "am-lite Manual"
+.SH NAME
+am-lite \- Minimalist Application Manager for AppImages and Portable Apps
+.SH SYNOPSIS
+.B am-lite
+[\fIglobal options\fR]
+.I <command>
+[\fIarguments\fR]
+.SH DESCRIPTION
+.B am-lite
+is a production-grade, lightweight package manager for AppImages and portable Linux binaries.
+It leverages the ivan-hc/AM repository database of over 2500 application installation scripts.
+For high-performance downloading, it transparently wraps download calls from those scripts and routes them through
+.BR aria2c (1).
+.PP
+If executed by a non-root user without global flags,
+.B am-lite
+automatically falls back to a sandboxed user-space mode.
+It rewrites installer script paths dynamically, permitting system-wide applications to install, run, and remove safely inside the user's home directory ($HOME) without root access.
+.SH COMMANDS
+.TP
+.BR \-i ", " install " " \fIapp\fR...
+Install one or more applications. Downloads and executes the corresponding install script.
+.TP
+.BR \-r ", " remove " " \fIapp\fR...
+Uninstall one or more applications. Executes the remover script associated with the applications.
+.TP
+.BR \-u ", " update " [" \fIapp\fR...]
+Update the specified applications. If no applications are specified, updates all currently installed applications.
+.TP
+.BR \-s ", " search " " \fIquery\fR
+Search the remote AM database for applications matching the query string.
+.TP
+.BR \-l ", " list
+List all applications currently installed via am-lite.
+.TP
+.BR \-h ", " help
+Show the help and usage summary.
+.SH GLOBAL OPTIONS
+.TP
+.BR \-y ", " \-\-yes
+Automatically answer "yes" to all installation confirmation prompts, executing non-interactively.
+.TP
+.BR \-g ", " \-\-global ", " \-\-system
+Force system-wide installation. This installs apps to /opt and symlinks to /usr/local/bin. Requires root privileges or sudo.
+.TP
+.BR \-c ", " \-\-config " " \fIfile\fR
+Specify an alternative configuration file to override the default system or user configurations.
+.TP
+.BR \-\-verbose
+Enable verbose debug logs to console and logfile.
+.TP
+.BR \-V ", " \-\-version
+Print the software version and exit.
+.SH FILES
+.TP
+.I /etc/am-lite.conf
+Default system-wide configuration file.
+.TP
+.I ~/.config/am-lite/config
+Default user-space configuration file.
+.TP
+.I ~/.local/share/am-lite/opt/
+Default installation path for user-space (non-root) installations.
+.TP
+.I /opt/
+Default installation path for system-wide (root) installations.
+.TP
+.I ~/.local/state/am-lite/am-lite.log
+Log file path for user-space actions.
+.TP
+.I /var/log/am-lite.log
+Log file path for system-wide actions.
+.SH SEE ALSO
+.BR aria2c (1),
+.BR curl (1),
+.BR wget (1)

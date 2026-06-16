@@ -1,0 +1,41 @@
+# am-lite.conf - Configuration for am-lite package manager
+# Place this file at /etc/am-lite.conf (system-wide) or ~/.config/am-lite/config (user-space)
+
+# Installation directories
+# Defaults:
+# System-wide (root): /opt
+# User-space (non-root): ~/.local/share/am-lite/opt
+#INSTALL_LOCATION="/opt"
+
+# Symlink binaries directories
+# Defaults:
+# System-wide: /usr/local/bin
+# User-space: ~/.local/bin
+#BIN_DIR="/usr/local/bin"
+
+# Desktop applications directory
+# Defaults:
+# System-wide: /usr/share/applications
+# User-space: ~/.local/share/applications
+#DESKTOP_DIR="/usr/share/applications"
+
+# The remote AM repository URL to pull scripts from
+#AM_REPO="https://raw.githubusercontent.com/ivan-hc/AM/main"
+
+# Log file path
+# Defaults:
+# System-wide: /var/log/am-lite.log
+# User-space: ~/.local/state/am-lite/am-lite.log
+#LOG_FILE="/var/log/am-lite.log"
+
+# Log level (DEBUG, INFO, WARN, ERROR)
+#LOG_LEVEL="INFO"
+
+# Use aria2c for downloads if available
+#USE_ARIA2=true
+
+# Maximum concurrent connections for aria2c
+#MAX_CONNECTIONS=16
+
+# Automatic yes to all confirmation prompts (true/false)
+#AUTO_CONFIRM=false
